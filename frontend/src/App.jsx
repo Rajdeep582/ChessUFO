@@ -6,7 +6,7 @@ import ReviewModal from './components/ReviewModal'
 import ReviewPanel from './components/ReviewPanel'
 import './App.css'
 
-const API = 'http://localhost:8000'
+const API = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 const START_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1'
 
 const CLASSIFY = {

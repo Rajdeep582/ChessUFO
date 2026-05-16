@@ -18,18 +18,24 @@ app.add_middleware(
 
 _engine_dir = os.path.join(os.path.dirname(__file__), "..", "engine")
 if sys.platform == "win32":
-    ENGINE_PATH = os.path.join(_engine_dir, "stockfish.exe")
+    _local = os.path.join(_engine_dir, "stockfish.exe")
 else:
-    ENGINE_PATH = os.path.join(_engine_dir, "stockfish")
+    _local = os.path.join(_engine_dir, "stockfish")
+
+# Prefer env var, then local binary, then system stockfish
+ENGINE_PATH = os.environ.get("STOCKFISH_PATH") or (
+    _local if os.path.exists(_local) else "stockfish"
+)
 engine: Optional[chess.engine.SimpleEngine] = None
 
 
 def get_engine() -> chess.engine.SimpleEngine:
     global engine
     if engine is None:
-        if not os.path.exists(ENGINE_PATH):
-            raise HTTPException(status_code=503, detail=f"Stockfish not found at {ENGINE_PATH}")
-        engine = chess.engine.SimpleEngine.popen_uci(ENGINE_PATH)
+        try:
+            engine = chess.engine.SimpleEngine.popen_uci(ENGINE_PATH)
+        except FileNotFoundError:
+            raise HTTPException(status_code=503, detail=f"Stockfish not found at '{ENGINE_PATH}'. Set STOCKFISH_PATH env var.")
     return engine
 
 
