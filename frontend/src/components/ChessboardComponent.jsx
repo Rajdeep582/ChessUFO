@@ -52,13 +52,26 @@ function fenToPos(fen) {
   return pos
 }
 
-export default function ChessboardComponent({ fen, flipped, onMove, pvLines = [], numArrows = 1, annotation }) {
+export default function ChessboardComponent({ fen, flipped, onMove, pvLines = [], numArrows = 1, annotation, size = 480 }) {
+  const sqSize = size / 8
+
+  // drag = committed drag (piece floating under finger/cursor)
   const [drag, setDrag] = useState(null)
   const [hoverSq, setHoverSq] = useState(null)
+  // tap-select state
+  const [selectedSq, setSelectedSq] = useState(null)
+  const [selectedLegal, setSelectedLegal] = useState(new Set())
+  // slide animation
+  const [moveAnim, setMoveAnim] = useState(null) // { piece, fromX, fromY, toX, toY, to, active }
+
   const boardRef = useRef(null)
   const dragRef = useRef(null)
+  const pendingRef = useRef(null)
   const onMoveRef = useRef(onMove)
   useEffect(() => { onMoveRef.current = onMove }, [onMove])
+
+  // reset selection when position changes
+  useEffect(() => { setSelectedSq(null); setSelectedLegal(new Set()) }, [fen])
 
   const pos = useMemo(() => fenToPos(fen), [fen])
   const chess = useMemo(() => new Chess(fen), [fen])
@@ -81,46 +94,115 @@ export default function ChessboardComponent({ fen, flipped, onMove, pvLines = []
     return `${files[ci]}${ranks[ri]}`
   }, [files, ranks])
 
+  const doMove = useCallback((from, to, skipAnim = false) => {
+    if (!skipAnim) {
+      const fci = files.indexOf(from[0]), fri = ranks.indexOf(parseInt(from[1]))
+      const tci = files.indexOf(to[0]),   tri = ranks.indexOf(parseInt(to[1]))
+      const piece = pos[from]
+      if (piece) {
+        const anim = {
+          piece,
+          fromX: fci * sqSize, fromY: fri * sqSize,
+          toX:   tci * sqSize, toY:   tri * sqSize,
+          to, active: false,
+        }
+        setMoveAnim(anim)
+        requestAnimationFrame(() => requestAnimationFrame(() =>
+          setMoveAnim(a => a ? { ...a, active: true } : null)
+        ))
+        setTimeout(() => setMoveAnim(null), 320)
+      }
+    }
+    onMoveRef.current(from, to, 'q')
+  }, [files, ranks, sqSize, pos])
+
   const onPointerDown = useCallback((e, sq) => {
-    const piece = pos[sq]
-    if (!piece || piece[0] !== chess.turn() || chess.isGameOver()) return
+    if (chess.isGameOver()) return
     e.preventDefault()
-    const legalTargets = new Set(chess.moves({ square: sq, verbose: true }).map(m => m.to))
-    if (legalTargets.size === 0) return
-    const state = { piece, src: sq, x: e.clientX, y: e.clientY, legalTargets }
-    setDrag(state); dragRef.current = state; setHoverSq(null)
-  }, [pos, chess])
 
+    // Case 1: piece selected + tapping legal target → move
+    if (selectedSq && selectedLegal.has(sq)) {
+      doMove(selectedSq, sq)
+      return
+    }
+
+    const piece = pos[sq]
+
+    // Case 2: own piece → select + begin potential drag
+    if (piece && piece[0] === chess.turn()) {
+      const legalTargets = new Set(chess.moves({ square: sq, verbose: true }).map(m => m.to))
+      setSelectedSq(sq)
+      setSelectedLegal(legalTargets)
+      if (legalTargets.size > 0) {
+        pendingRef.current = { piece, src: sq, x0: e.clientX, y0: e.clientY, legalTargets }
+      }
+      return
+    }
+
+    // Case 3: clicked elsewhere → deselect
+    setSelectedSq(null); setSelectedLegal(new Set())
+  }, [pos, chess, selectedSq, selectedLegal, doMove])
+
+  // Global pointer tracking for drag
   useEffect(() => {
-    if (!drag) return
-    const onPM = (e) => {
-      const sq = sqFromPoint(e.clientX, e.clientY)
-      const next = { ...dragRef.current, x: e.clientX, y: e.clientY }
-      dragRef.current = next; setDrag(next)
-      setHoverSq(sq && dragRef.current.legalTargets.has(sq) ? sq : null)
-    }
-    const onPU = (e) => {
-      const targetSq = sqFromPoint(e.clientX, e.clientY)
-      if (targetSq && dragRef.current?.legalTargets.has(targetSq))
-        onMoveRef.current(dragRef.current.src, targetSq, 'q')
-      setDrag(null); setHoverSq(null); dragRef.current = null
-    }
-    window.addEventListener('pointermove', onPM)
-    window.addEventListener('pointerup', onPU)
-    return () => { window.removeEventListener('pointermove', onPM); window.removeEventListener('pointerup', onPU) }
-  }, [drag, sqFromPoint])
+    const DRAG_THRESHOLD = 8
 
+    const onPM = (e) => {
+      const cx = e.clientX
+      const cy = e.clientY
+      if (cx == null) return
+
+      if (dragRef.current) {
+        const next = { ...dragRef.current, x: cx, y: cy }
+        dragRef.current = next; setDrag(next)
+        const sq = sqFromPoint(cx, cy)
+        setHoverSq(sq && dragRef.current.legalTargets.has(sq) ? sq : null)
+      } else if (pendingRef.current) {
+        const { x0, y0 } = pendingRef.current
+        if (Math.hypot(cx - x0, cy - y0) > DRAG_THRESHOLD) {
+          const state = { ...pendingRef.current, x: cx, y: cy }
+          dragRef.current = state; setDrag(state)
+          pendingRef.current = null
+        }
+      }
+    }
+
+    const onPU = (e) => {
+      const cx = e.clientX
+      const cy = e.clientY
+
+      if (dragRef.current) {
+        if (cx != null) {
+          const targetSq = sqFromPoint(cx, cy)
+          if (targetSq && dragRef.current.legalTargets.has(targetSq))
+            doMove(dragRef.current.src, targetSq, true) // drag: skip slide anim
+        }
+        dragRef.current = null; setDrag(null); setHoverSq(null)
+      }
+      pendingRef.current = null
+    }
+
+    window.addEventListener('pointermove', onPM, { passive: true })
+    window.addEventListener('pointerup', onPU)
+    return () => {
+      window.removeEventListener('pointermove', onPM)
+      window.removeEventListener('pointerup', onPU)
+    }
+  }, [sqFromPoint, doMove])
+
+  const sc = size / 480
   const ARROW_STYLES = [
-    { sw: 9, hw: 22, hl: 24, sg: 18, fill: 'rgba(100,110,200,0.82)' },
-    { sw: 5, hw: 14, hl: 20, sg: 18, fill: 'rgba(100,110,200,0.55)' },
-    { sw: 3, hw: 10, hl: 17, sg: 18, fill: 'rgba(100,110,200,0.38)' },
+    { sw: 9*sc, hw: 22*sc, hl: 24*sc, sg: 18*sc, fill: 'rgba(100,110,200,0.82)' },
+    { sw: 5*sc, hw: 14*sc, hl: 20*sc, sg: 18*sc, fill: 'rgba(100,110,200,0.55)' },
+    { sw: 3*sc, hw: 10*sc, hl: 17*sc, sg: 18*sc, fill: 'rgba(100,110,200,0.38)' },
   ]
 
   const arrowPaths = useMemo(() => {
+    const half = sqSize / 2
     const getXY = (sq) => {
       const ci = files.indexOf(sq[0])
       const ri = ranks.indexOf(parseInt(sq[1]))
-      return [ci * 60 + 30, ri * 60 + 30]
+      return [ci * sqSize + half, ri * sqSize + half]
     }
     const makePath = (uci, style) => {
       if (!uci || uci.length < 4) return null
@@ -143,41 +225,45 @@ export default function ChessboardComponent({ fen, flipped, onMove, pvLines = []
       path: makePath(line?.moves?.[0], ARROW_STYLES[i]),
       fill: ARROW_STYLES[i].fill,
     })).filter(a => a.path)
-  }, [pvLines, numArrows, files, ranks])
+  }, [pvLines, numArrows, files, ranks, sqSize])
 
   return (
     <div className="board-wrapper"
-      style={{ position:'relative', width:480, height:480, userSelect:'none', WebkitUserSelect:'none' }}>
+      style={{ position:'relative', width:size, height:size, userSelect:'none', WebkitUserSelect:'none' }}>
       <div ref={boardRef}
-        style={{ display:'grid', gridTemplateColumns:'repeat(8,60px)', gridTemplateRows:'repeat(8,60px)', width:480, height:480 }}>
+        style={{ display:'grid', gridTemplateColumns:`repeat(8,${sqSize}px)`, gridTemplateRows:`repeat(8,${sqSize}px)`, width:size, height:size, touchAction:'none' }}>
         {ranks.flatMap((rank, ri) => files.map((file, ci) => {
           const sq = `${file}${rank}`
           const piece = pos[sq]
           const isDragSrc = drag?.src === sq
-          const isLegal = drag?.legalTargets.has(sq)
+          const isAnimTo = moveAnim?.to === sq
+          const isSelected = selectedSq === sq
+          const isLegal = selectedLegal.has(sq)
           const isHover = hoverSq === sq
           const isLight = (ci + ri) % 2 === 0
-          const canPickUp  = piece?.[0] === chess.turn() && !chess.isGameOver() && !drag
-          const isAnnotSq  = annotation?.toSq === sq
+          const isAnnotSq = annotation?.toSq === sq
+          const canInteract = !chess.isGameOver()
 
           return (
             <div key={sq}
-              onPointerDown={canPickUp ? (e) => onPointerDown(e, sq) : undefined}
+              onPointerDown={canInteract ? (e) => onPointerDown(e, sq) : undefined}
               style={{
-                position:'relative', width:60, height:60,
-                backgroundColor: isLight ? '#f0d9b5' : '#b58863',
-                cursor: piece?.[0] === chess.turn() && !chess.isGameOver()
-                  ? (drag ? 'grabbing' : 'grab') : 'default',
+                position:'relative', width:sqSize, height:sqSize,
+                backgroundColor: isSelected
+                  ? (isLight ? '#f6f67d' : '#baca2b')
+                  : (isLight ? '#f0d9b5' : '#b58863'),
+                cursor: canInteract
+                  ? (drag ? 'grabbing' : (piece?.[0] === chess.turn() || (selectedSq && isLegal) ? 'pointer' : 'default'))
+                  : 'default',
               }}>
-
 
               {isLegal && (
                 <div style={{
                   position:'absolute', top:'50%', left:'50%',
                   transform:'translate(-50%,-50%)', pointerEvents:'none',
                   ...(piece && !isDragSrc
-                    ? { width:'88%', height:'88%', border:'5px solid rgba(0,0,0,0.18)', borderRadius:'50%', boxSizing:'border-box' }
-                    : { width:'34%', height:'34%', borderRadius:'50%', backgroundColor:'rgba(0,0,0,0.15)' }),
+                    ? { width:'88%', height:'88%', border:`${Math.max(3, sqSize*0.08)}px solid rgba(0,0,0,0.22)`, borderRadius:'50%', boxSizing:'border-box' }
+                    : { width:'34%', height:'34%', borderRadius:'50%', backgroundColor:'rgba(0,0,0,0.18)' }),
                 }} />
               )}
 
@@ -187,11 +273,13 @@ export default function ChessboardComponent({ fen, flipped, onMove, pvLines = []
 
               {piece && (
                 <img src={PIECE_URL(piece)} alt={piece} draggable={false}
-                  style={{ width:'100%', height:'100%', display:'block', pointerEvents:'none', opacity: isDragSrc ? 0.2 : 1,
-                    imageRendering: 'auto', WebkitFontSmoothing: 'antialiased' }} />
+                  style={{
+                    width:'100%', height:'100%', display:'block', pointerEvents:'none',
+                    opacity: isDragSrc ? 0.15 : (isAnimTo ? 0 : 1),
+                    imageRendering: 'auto',
+                  }} />
               )}
 
-              {/* Move classification annotation icon */}
               {isAnnotSq && annotation?.classification && (
                 <AnnotationIcon classification={annotation.classification} />
               )}
@@ -209,19 +297,37 @@ export default function ChessboardComponent({ fen, flipped, onMove, pvLines = []
         }))}
       </div>
 
+      {/* Slide animation overlay */}
+      {moveAnim && (
+        <img
+          src={PIECE_URL(moveAnim.piece)}
+          alt=""
+          draggable={false}
+          style={{
+            position: 'absolute',
+            width: sqSize, height: sqSize,
+            left: moveAnim.active ? moveAnim.toX : moveAnim.fromX,
+            top:  moveAnim.active ? moveAnim.toY : moveAnim.fromY,
+            transition: moveAnim.active
+              ? 'left 0.22s cubic-bezier(0.25,0.46,0.45,0.94), top 0.22s cubic-bezier(0.25,0.46,0.45,0.94)'
+              : 'none',
+            pointerEvents: 'none',
+            zIndex: 8,
+          }}
+        />
+      )}
+
       {arrowPaths.length > 0 && !drag && (
-        <svg style={{ position:'absolute', inset:0, width:480, height:480, pointerEvents:'none' }} viewBox="0 0 480 480">
-          {/* draw thinnest first so best is on top */}
+        <svg style={{ position:'absolute', inset:0, width:size, height:size, pointerEvents:'none', zIndex:9 }} viewBox={`0 0 ${size} ${size}`}>
           {[...arrowPaths].reverse().map((a, i) => (
             <path key={i} d={a.path} fill={a.fill} />
           ))}
         </svg>
       )}
 
-
       {drag && createPortal(
         <img src={PIECE_URL(drag.piece)} alt={drag.piece} draggable={false}
-          style={{ position:'fixed', left:drag.x-36, top:drag.y-36, width:72, height:72,
+          style={{ position:'fixed', left:drag.x - sqSize*0.6, top:drag.y - sqSize*0.6, width:sqSize*1.2, height:sqSize*1.2,
             pointerEvents:'none', zIndex:9999, filter:'drop-shadow(0 6px 18px rgba(0,0,0,0.6))' }} />,
         document.body
       )}

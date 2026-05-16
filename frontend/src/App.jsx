@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Chess } from 'chess.js'
-import { motion, useSpring, useTransform } from 'framer-motion'
+// framer-motion removed for eval bar — using CSS transitions
 import ChessboardComponent from './components/ChessboardComponent'
 import ReviewModal from './components/ReviewModal'
 import ReviewPanel from './components/ReviewPanel'
@@ -60,6 +60,8 @@ export default function App() {
   const [engineOn, setEngineOn] = useState(true)
   const [evalBarOn, setEvalBarOn] = useState(true)
   const [fenInput, setFenInput] = useState('')
+  const [pgnInput, setPgnInput] = useState('')
+  const [pgnError, setPgnError] = useState('')
   const [review, setReview] = useState(() => {
     try { return JSON.parse(localStorage.getItem('cuf_review') || 'null') } catch { return null }
   })
@@ -68,8 +70,16 @@ export default function App() {
   const [showReviewModal, setShowReviewModal] = useState(false)
   const [selectedPVIdx, setSelectedPVIdx] = useState(0)
   const [numArrows, setNumArrows] = useState(1)
+  const calcBoardSize = () => Math.min(480, window.innerWidth - 48) // 48 = eval bar + padding
+  const [boardSize, setBoardSize] = useState(calcBoardSize)
   const analyzeTimer = useRef(null)
   const notationRef = useRef(null)
+
+  useEffect(() => {
+    const onResize = () => setBoardSize(calcBoardSize())
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
 
   useEffect(() => { localStorage.setItem('cuf_fen', fen) }, [fen])
   useEffect(() => { localStorage.setItem('cuf_hist', JSON.stringify(history)) }, [history])
@@ -165,6 +175,31 @@ export default function App() {
     } catch { alert('Invalid FEN') }
   }
 
+  const importPGN = () => {
+    try {
+      const text = pgnInput.trim()
+      if (!text) return
+      const g = new Chess()
+      g.loadPgn(text)
+      const moves = g.history({ verbose: true })
+      if (!moves.length) { setPgnError('No moves found in PGN'); return }
+      const replayG = new Chess()
+      const newHistory = moves.map(mv => {
+        replayG.move({ from: mv.from, to: mv.to, promotion: mv.promotion })
+        return { fen: replayG.fen(), san: mv.san, uci: mv.from + mv.to + (mv.promotion || '') }
+      })
+      setHistory(newHistory)
+      setHistoryIdx(newHistory.length - 1)
+      setFen(replayG.fen())
+      setGame(replayG)
+      setReview(null); setShowReviewPanel(false)
+      localStorage.removeItem('cuf_review')
+      setPgnInput(''); setPgnError('')
+    } catch (e) {
+      setPgnError('Invalid PGN — ' + (e.message || 'parse error'))
+    }
+  }
+
   const reset = () => {
     localStorage.removeItem('cuf_fen'); localStorage.removeItem('cuf_hist')
     localStorage.removeItem('cuf_hidx'); localStorage.removeItem('cuf_review')
@@ -212,10 +247,6 @@ export default function App() {
   const pvLines  = analysis?.pv_lines ?? []
   const activePVLines = engineOn ? pvLines : []
 
-  const springPct = useSpring(whitePct, { stiffness: 28, damping: 16, mass: 1.2 })
-  useEffect(() => { springPct.set(whitePct) }, [whitePct, springPct])
-  const blackH = useTransform(springPct, v => `${100 - v}%`)
-  const whiteH = useTransform(springPct, v => `${v}%`)
 
   const pairs = []
   for (let i = 0; i < history.length; i += 2)
@@ -246,35 +277,19 @@ export default function App() {
         {/* Board + eval bar */}
         <div className="board-area">
           <div style={{ display:'flex', flexDirection:'column', gap:0 }}>
-            {engineOn && activePVLines.length > 1 && (
-              <div style={{ display:'flex', justifyContent:'flex-end', marginBottom:4 }}>
-                <select
-                  value={numArrows}
-                  onChange={e => setNumArrows(Number(e.target.value))}
-                  style={{
-                    background:'#1e1c1a', color:'#c9b267',
-                    border:'1px solid rgba(201,178,103,0.35)', borderRadius:5,
-                    padding:'3px 10px', fontSize:'0.72rem', fontWeight:600,
-                    cursor:'pointer', outline:'none',
-                  }}>
-                  {[1,2,3].filter(n => n <= activePVLines.length).map(n => (
-                    <option key={n} value={n}>{n} line{n>1?'s':''}</option>
-                  ))}
-                </select>
-              </div>
-            )}
-            <ChessboardComponent fen={fen} flipped={flipped} onMove={onMove} pvLines={activePVLines} numArrows={numArrows} annotation={annotation} />
+            <ChessboardComponent fen={fen} flipped={flipped} onMove={onMove} pvLines={activePVLines} numArrows={numArrows} annotation={annotation} size={boardSize} />
           </div>
           {evalBarOn && (
-            <div className="eval-bar-wrap" title={score}>
-              <motion.div className="eval-bar-black" style={{ height: blackH }} />
-              <motion.div className="eval-bar-white" style={{ height: whiteH }} />
+            <div className="eval-bar-wrap" title={score} style={{ height: boardSize }}>
+              <div className="eval-bar-black" style={{ height: `${100 - whitePct}%` }} />
+              <div className="eval-bar-white" style={{ height: `${whitePct}%` }} />
             </div>
           )}
         </div>
 
         {/* Right panel */}
-        <div className={`right-panel${showReviewPanel && review ? ' right-panel--review' : ''}`}>
+        <div className={`right-panel${showReviewPanel && review ? ' right-panel--review' : ''}`}
+          style={{ height: boardSize }}>
 
           {showReviewPanel && review ? (
             /* ── REVIEW RESULTS VIEW ── */
@@ -304,25 +319,22 @@ export default function App() {
                 <span className="engine-depth">{engineOn && analysis ? `d${analysis.depth}` : ''}</span>
                 <button className={`evalbar-toggle ${evalBarOn ? 'active' : ''}`}
                   onClick={() => setEvalBarOn(e => !e)} title="Toggle eval bar">▌</button>
+                {engineOn && activePVLines.length > 1 && (
+                  <select
+                    value={numArrows}
+                    onChange={e => setNumArrows(Number(e.target.value))}
+                    style={{
+                      background:'#1e1c1a', color:'#c9b267',
+                      border:'1px solid rgba(201,178,103,0.35)', borderRadius:5,
+                      padding:'2px 8px', fontSize:'0.68rem', fontWeight:600,
+                      cursor:'pointer', outline:'none', marginLeft:'auto',
+                    }}>
+                    {[1,2,3].filter(n => n <= activePVLines.length).map(n => (
+                      <option key={n} value={n}>{n} line{n>1?'s':''}</option>
+                    ))}
+                  </select>
+                )}
               </div>
-
-              {/* PV lines */}
-              {engineOn && pvLines.length > 0 && (
-                <div className="pv-section">
-                  {pvLines.map((line, i) => {
-                    const cont = line.san?.slice(0, 2).join(' ') || line.moves?.[0] || ''
-                    return (
-                      <div key={i}
-                        className="pv-line"
-                        onClick={() => jumpToPV(line.moves)}>
-                        <span className="pv-rank">{i + 1}</span>
-                        <span className="pv-cont">{cont}</span>
-                        <span className="pv-score" style={{ color: scoreColor(line.score) }}>{line.score}</span>
-                      </div>
-                    )
-                  })}
-                </div>
-              )}
 
               {/* Move notation */}
               <div className="notation-scroll" ref={notationRef}>
@@ -357,12 +369,14 @@ export default function App() {
 
               {/* Nav controls */}
               <div className="nav-controls">
-                <button className="nav-btn" onClick={reset} title="Reset">⊗</button>
-                <button className="nav-btn" onClick={() => setFlipped(f => !f)} title="Flip">⇅</button>
-                <button className="nav-btn" onClick={() => jumpToHistory(-1)} title="Start" disabled={historyIdx < 0}>⏮</button>
-                <button className="nav-btn" onClick={() => jumpToHistory(historyIdx - 1)} title="Back" disabled={historyIdx < 0}>‹</button>
-                <button className="nav-btn" onClick={() => jumpToHistory(historyIdx + 1)} title="Fwd" disabled={historyIdx >= history.length - 1}>›</button>
-                <button className="nav-btn" onClick={() => jumpToHistory(history.length - 1)} title="End" disabled={historyIdx >= history.length - 1}>⏭</button>
+                <button className="nav-btn" onClick={reset} title="Reset board">⊗</button>
+                <button className="nav-btn" onClick={() => setFlipped(f => !f)} title="Flip board">⇅</button>
+                <div className="nav-btn-group">
+                  <button className="nav-btn" onClick={() => jumpToHistory(-1)} title="Start" disabled={historyIdx < 0}>⏮</button>
+                  <button className="nav-btn" onClick={() => jumpToHistory(historyIdx - 1)} title="Previous" disabled={historyIdx < 0}>‹</button>
+                  <button className="nav-btn" onClick={() => jumpToHistory(historyIdx + 1)} title="Next" disabled={historyIdx >= history.length - 1}>›</button>
+                  <button className="nav-btn" onClick={() => jumpToHistory(history.length - 1)} title="End" disabled={historyIdx >= history.length - 1}>⏭</button>
+                </div>
                 <div className="depth-wrap">
                   <input type="range" min={8} max={28} value={depth}
                     onChange={e => setDepth(+e.target.value)}
@@ -401,6 +415,22 @@ export default function App() {
           onFocus={e => { setFenInput(fen); e.target.select() }}
           spellCheck={false}
         />
+      </div>
+
+      {/* PGN bar */}
+      <div className="pgn-bar">
+        <span className="fen-label">PGN</span>
+        <textarea
+          className="pgn-input"
+          value={pgnInput}
+          onChange={e => { setPgnInput(e.target.value); setPgnError('') }}
+          onKeyDown={e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); importPGN() } }}
+          placeholder="Paste PGN here… (Ctrl+Enter to import)"
+          spellCheck={false}
+          rows={2}
+        />
+        <button className="pgn-btn" onClick={importPGN}>Import</button>
+        {pgnError && <span className="pgn-error">{pgnError}</span>}
       </div>
       {showReviewModal && (
         <ReviewModal
