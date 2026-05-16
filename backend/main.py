@@ -2,8 +2,10 @@ import os
 import sys
 import math
 import asyncio
-import multiprocessing
+import logging
 from typing import Optional
+
+logging.basicConfig(level=logging.INFO)
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -11,11 +13,10 @@ import chess
 import chess.engine
 
 # ── Engine tuning ──────────────────────────────────────────────
-# Threads: use all CPU cores (leave 1 for OS/server)
-THREADS = int(os.environ.get("STOCKFISH_THREADS", max(1, (os.cpu_count() or 4) - 1)))
-# Hash: 256 MB default, override via env (in MB)
-HASH_MB = int(os.environ.get("STOCKFISH_HASH_MB", 256))
-ENGINE_OPTIONS = {"Threads": THREADS, "Hash": HASH_MB, "UCI_AnalyseMode": True}
+THREADS = int(os.environ.get("STOCKFISH_THREADS", max(1, (os.cpu_count() or 2) - 1)))
+HASH_MB  = int(os.environ.get("STOCKFISH_HASH_MB", 128))
+# UCI_AnalyseMode omitted — not supported by older apt Stockfish builds
+ENGINE_OPTIONS = {"Threads": THREADS, "Hash": HASH_MB}
 # ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="ChessUFO API")
@@ -44,10 +45,19 @@ def get_engine() -> chess.engine.SimpleEngine:
     global engine
     if engine is None:
         try:
+            logging.info(f"Starting Stockfish at: {ENGINE_PATH}")
             engine = chess.engine.SimpleEngine.popen_uci(ENGINE_PATH)
-            engine.configure(ENGINE_OPTIONS)
+            # Apply options one by one so a bad option doesn't kill init
+            for k, v in ENGINE_OPTIONS.items():
+                try:
+                    engine.configure({k: v})
+                except Exception as e:
+                    logging.warning(f"Engine option {k}={v} rejected: {e}")
+            logging.info(f"Engine ready. Threads={THREADS} Hash={HASH_MB}MB")
         except FileNotFoundError:
-            raise HTTPException(status_code=503, detail=f"Stockfish not found at '{ENGINE_PATH}'. Set STOCKFISH_PATH env var.")
+            raise RuntimeError(f"Stockfish not found at '{ENGINE_PATH}'. Set STOCKFISH_PATH env var.")
+        except Exception as e:
+            raise RuntimeError(f"Engine init failed: {e}")
     return engine
 
 
@@ -158,10 +168,15 @@ review_engine: Optional[chess.engine.SimpleEngine] = None
 def get_review_engine() -> chess.engine.SimpleEngine:
     global review_engine
     if review_engine is None:
-        if not os.path.exists(ENGINE_PATH):
-            raise HTTPException(status_code=503, detail="Stockfish not found")
-        review_engine = chess.engine.SimpleEngine.popen_uci(ENGINE_PATH)
-        review_engine.configure(ENGINE_OPTIONS)
+        try:
+            review_engine = chess.engine.SimpleEngine.popen_uci(ENGINE_PATH)
+            for k, v in ENGINE_OPTIONS.items():
+                try:
+                    review_engine.configure({k: v})
+                except Exception as e:
+                    logging.warning(f"Review engine option {k}={v} rejected: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Review engine init failed: {e}")
     return review_engine
 
 # ── Expected Points helpers (chess.com model) ──────────────────
