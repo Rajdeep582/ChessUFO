@@ -1,11 +1,22 @@
 import os
 import sys
+import math
+import asyncio
+import multiprocessing
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import chess
 import chess.engine
+
+# ── Engine tuning ──────────────────────────────────────────────
+# Threads: use all CPU cores (leave 1 for OS/server)
+THREADS = int(os.environ.get("STOCKFISH_THREADS", max(1, (os.cpu_count() or 4) - 1)))
+# Hash: 256 MB default, override via env (in MB)
+HASH_MB = int(os.environ.get("STOCKFISH_HASH_MB", 256))
+ENGINE_OPTIONS = {"Threads": THREADS, "Hash": HASH_MB, "UCI_AnalyseMode": True}
+# ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="ChessUFO API")
 
@@ -34,6 +45,7 @@ def get_engine() -> chess.engine.SimpleEngine:
     if engine is None:
         try:
             engine = chess.engine.SimpleEngine.popen_uci(ENGINE_PATH)
+            engine.configure(ENGINE_OPTIONS)
         except FileNotFoundError:
             raise HTTPException(status_code=503, detail=f"Stockfish not found at '{ENGINE_PATH}'. Set STOCKFISH_PATH env var.")
     return engine
@@ -78,23 +90,10 @@ def health():
     return {"status": "ok", "engine": os.path.exists(ENGINE_PATH)}
 
 
-@app.post("/analyze")
-def analyze(req: AnalyzeRequest):
-    try:
-        board = chess.Board(req.fen)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid FEN")
-
+def _do_analyze(fen: str, depth: int) -> dict:
+    board = chess.Board(fen)
     eng = get_engine()
-
-    try:
-        info_list = eng.analyse(
-            board,
-            chess.engine.Limit(depth=req.depth),
-            multipv=3,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    info_list = eng.analyse(board, chess.engine.Limit(depth=depth), multipv=3)
 
     pv_lines = []
     bestmove = None
@@ -103,31 +102,31 @@ def analyze(req: AnalyzeRequest):
     for i, info in enumerate(info_list):
         score = info.get("score")
         pv = info.get("pv", [])
-
         score_str = "0.00"
         if score:
             score_str = format_score(score, board.turn)
             if top_score is None:
                 top_score = score_str
-
         uci_moves = [m.uci() for m in pv]
         san_moves = moves_to_san(board, uci_moves)
-
         if i == 0 and pv:
             bestmove = pv[0].uci()
+        pv_lines.append({"score": score_str, "moves": uci_moves[:10], "san": san_moves[:10]})
 
-        pv_lines.append({
-            "score": score_str,
-            "moves": uci_moves[:10],
-            "san": san_moves[:10],
-        })
+    return {"score": top_score or "0.00", "bestmove": bestmove, "pv_lines": pv_lines, "depth": depth}
 
-    return {
-        "score": top_score or "0.00",
-        "bestmove": bestmove,
-        "pv_lines": pv_lines,
-        "depth": req.depth,
-    }
+
+@app.post("/analyze")
+async def analyze(req: AnalyzeRequest):
+    try:
+        chess.Board(req.fen)  # validate
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid FEN")
+    try:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _do_analyze, req.fen, req.depth)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/bestmove")
@@ -162,15 +161,71 @@ def get_review_engine() -> chess.engine.SimpleEngine:
         if not os.path.exists(ENGINE_PATH):
             raise HTTPException(status_code=503, detail="Stockfish not found")
         review_engine = chess.engine.SimpleEngine.popen_uci(ENGINE_PATH)
+        review_engine.configure(ENGINE_OPTIONS)
     return review_engine
 
-def _classify(is_best: bool, loss_cp: float) -> str:
-    if is_best or loss_cp <= 5:   return "best"
-    if loss_cp <= 20:              return "excellent"
-    if loss_cp <= 60:              return "good"
-    if loss_cp <= 120:             return "inaccuracy"
-    if loss_cp <= 280:             return "mistake"
-    if loss_cp <= 500:             return "miss"
+# ── Expected Points helpers (chess.com model) ──────────────────
+def _cp_to_ep(cp: float) -> float:
+    """Centipawns → win probability [0,1]. k≈1/272 matches chess.com logistic."""
+    return 1.0 / (1.0 + math.exp(-cp / 272.0))
+
+PIECE_VAL = {
+    chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+    chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0,
+}
+
+def _is_sacrifice(board: chess.Board, move: chess.Move) -> bool:
+    """True if move gives up material — captures lower-value piece, or moves into attack by lower-value piece."""
+    piece = board.piece_at(move.from_square)
+    if piece is None:
+        return False
+    mover_val = PIECE_VAL.get(piece.piece_type, 0)
+    captured = board.piece_at(move.to_square)
+    if captured:
+        # Capturing cheaper piece = sacrifice
+        return mover_val > PIECE_VAL.get(captured.piece_type, 0) + 1
+    # Non-capture: moving into square attacked by cheaper opponent piece
+    b2 = board.copy()
+    b2.push(move)
+    for sq in b2.attackers(not board.turn, move.to_square):
+        att = b2.piece_at(sq)
+        if att and PIECE_VAL.get(att.piece_type, 0) < mover_val:
+            return True
+    return False
+
+def _classify_move(
+    is_best: bool, loss_ep: float,
+    ep_before: float, ep_after: float,
+    is_sac: bool,
+) -> str:
+    """
+    Chess.com EP-based classification:
+      Best        loss = 0.00
+      Excellent   loss ≤ 0.02
+      Good        loss ≤ 0.05
+      Inaccuracy  loss ≤ 0.10
+      Mistake     loss ≤ 0.20
+      Blunder     loss > 0.20
+    Plus special:
+      Brilliant   sacrifice + best/excellent + not losing after + wasn't already crushing
+      Great       game-turning (equal/losing → winning) + excellent move
+      Miss        had winning pos (ep_before > 0.70) + lost major advantage (loss_ep > 0.10)
+    """
+    # Brilliant: piece sac, nearly best, still safe after, position wasn't already won
+    if is_sac and loss_ep <= 0.02 and ep_after >= 0.45 and ep_before <= 0.88:
+        return "brilliant"
+    # Great: game-turning move (not winning → winning, excellent quality)
+    if ep_before <= 0.46 and ep_after >= 0.54 and loss_ep <= 0.02:
+        return "great"
+    # Miss: had winning advantage, failed to capitalise
+    if ep_before >= 0.70 and loss_ep > 0.10:
+        return "miss"
+    # Standard EP thresholds
+    if is_best or loss_ep <= 0.001:  return "best"
+    if loss_ep <= 0.02:              return "excellent"
+    if loss_ep <= 0.05:              return "good"
+    if loss_ep <= 0.10:              return "inaccuracy"
+    if loss_ep <= 0.20:              return "mistake"
     return "blunder"
 
 def _score_cp(score_obj: chess.engine.Score, color: chess.Color) -> float:
@@ -222,6 +277,14 @@ def _do_review(fens: list, moves: list, depth: int = 12) -> list:
             loss_cp   = max(0.0, before_cp - after_cp)
             is_best   = (uci == ev_before["best"])
 
+            # Convert to Expected Points (chess.com model)
+            ep_before = _cp_to_ep(before_cp)
+            ep_after  = _cp_to_ep(after_cp)
+            loss_ep   = max(0.0, ep_before - ep_after)
+
+            is_sac = _is_sacrifice(board, move)
+            classification = _classify_move(is_best, loss_ep, ep_before, ep_after, is_sac)
+
             results.append({
                 "move": uci,
                 "san": san,
@@ -229,13 +292,12 @@ def _do_review(fens: list, moves: list, depth: int = 12) -> list:
                 "eval_before": round(before_cp / 100, 2),
                 "eval_after":  round(after_cp  / 100, 2),
                 "loss_cp": round(loss_cp, 1),
-                "classification": _classify(is_best, loss_cp),
+                "loss_ep": round(loss_ep, 4),
+                "classification": classification,
             })
         except Exception as e:
             results.append({"move": uci, "san": uci, "classification": "unknown", "loss_cp": 0, "error": str(e)})
     return results
-
-import asyncio
 
 @app.post("/review")
 async def review_game(req: ReviewRequest):
